@@ -14,6 +14,7 @@ use sui_quorum_driver::QuorumDriverHandler;
 use sui_types::base_types::{ObjectID, ObjectRef};
 use sui_types::messages::{
     ExecuteTransactionRequest, ExecuteTransactionRequestType, ExecuteTransactionResponse,
+    Transaction,
 };
 use sui_types::object::Owner;
 use test_utils::authority::{
@@ -65,6 +66,7 @@ enum NextOp {
     Stat(Instant),
     Request(Instant),
     Response(Option<(Instant, CounterAndGas)>),
+    Retry(Box<(Transaction, ObjectID, Owner)>),
 }
 
 fn get_interval(start: Instant, delay_micros: u64) -> Interval {
@@ -138,8 +140,7 @@ async fn main() {
         (counter_id, new_gas_ref)
     });
 
-    let counter_and_gas: Vec<(ObjectID, (ObjectRef, Owner))> =
-        join_all(futures).await.into_iter().collect();
+    let counter_and_gas: Vec<CounterAndGas> = join_all(futures).await.into_iter().collect();
 
     write(
         format!("Done creating {} counters!", counter_and_gas.len()),
@@ -236,7 +237,7 @@ async fn main() {
                             make_counter_increment_transaction(gas.1 .0, package_ref, counter_id);
                         let res = qd
                             .execute_transaction(ExecuteTransactionRequest {
-                                transaction: tx,
+                                transaction: tx.clone(),
                                 request_type: ExecuteTransactionRequestType::WaitForEffectsCert,
                             })
                             .map(move |res| {
@@ -249,14 +250,12 @@ async fn main() {
                                         )))
                                     }
                                     Err(_sui_err) => {
-                                        //eprintln!("{}", sui_err);
-                                        // TODO (GAS-LEAK): How do we add this gas back in the pool?
-                                        NextOp::Response(None)
+                                        // eprintln!("{}", sui_err);
+                                        NextOp::Retry(Box::new((tx, counter_id, owner)))
                                     }
                                     _ => {
                                         // eprintln!("error");
-                                        // TODO (GAS-LEAK): How do we add this gas back in the pool?
-                                        NextOp::Response(None)
+                                        NextOp::Retry(Box::new((tx, counter_id, owner)))
                                     }
                                 }
                             });
@@ -268,6 +267,35 @@ async fn main() {
                             )
                             .map(NextOp::Request),
                         ));
+                    }
+                    NextOp::Retry(b) => {
+                        num_submitted += 1;
+                        num_error += 1;
+                        let res = qd
+                            .execute_transaction(ExecuteTransactionRequest {
+                                transaction: b.0.clone(),
+                                request_type: ExecuteTransactionRequestType::WaitForEffectsCert,
+                            })
+                            .map(move |res| {
+                                match res {
+                                    Ok(ExecuteTransactionResponse::EffectsCert(result)) => {
+                                        let (_, effects) = *result;
+                                        NextOp::Response(Some((
+                                            Instant::now(),
+                                            (b.1, (effects.effects.gas_object.0, b.2)),
+                                        )))
+                                    }
+                                    Err(_sui_err) => {
+                                        //eprintln!("{}", _sui_err);
+                                        NextOp::Retry(b)
+                                    }
+                                    _ => {
+                                        // eprintln!("error");
+                                        NextOp::Retry(b)
+                                    }
+                                }
+                            });
+                        futures.push(Box::pin(res));
                     }
                     NextOp::Response(Some((start, payload))) => {
                         free_pool.push(payload);
@@ -284,7 +312,6 @@ async fn main() {
                     }
                     NextOp::Response(None) => {
                         num_in_flight -= 1;
-                        num_error += 1;
                     }
                 }
             }
